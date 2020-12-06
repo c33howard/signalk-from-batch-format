@@ -142,7 +142,7 @@ module.exports = function(app) {
     let _publish_to_signalk = function(rows) {
         let updates = rows.map(function(row) {
             // we only publish the last timestamp, so remove the path key
-            const data = _.omit(row, ['path']);
+            const data = _.omit(row, ['path', 'source']);
 
             // the rest of the keys are timestamps
             const timestamps = _.keys(data);
@@ -155,13 +155,25 @@ module.exports = function(app) {
 
             // return a signalk update in delta format
             // (this will be part of a list)
-            return {
+            const delta = {
                 timestamp: new Date(parseInt(last_timestamp)).toISOString(),
                 values: [{
                     path: row.path,
                     value: value
                 }]
             };
+
+            // add the source, if it exists
+            // TODO: this does no good, because for some reason, signalk stomps
+            // source.label with my providerId (ie pluginId).  You're killing
+            // me smalls.
+            if (false && row.source) {
+                delta.source = {
+                    label: row.source
+                };
+            }
+
+            return delta;
         });
 
         // fix the stupid combined objects, no doubt I'll need to add to this
