@@ -1,9 +1,9 @@
 {
-  "name": "signalk-from-csv",
+  "name": "signalk-from-batch-format",
   "version": "1.0.0",
-  "description": "Signal K server plugin that ingests data from csv files",
+  "description": "Signal K server plugin that ingests data from batch format files",
   "main": "index.js",
-  "repository": "https://github.com/c33howard/signalk-from-csv.git",
+  "repository": "https://github.com/c33howard/signalk-from-batch-format.git",
   "keywords": [
     "signalk-node-server-plugin"
   ],
@@ -12,7 +12,6 @@
   "dependencies": {
     "debug": "^2.2.0",
     "lodash": "^4.17.4",
-    "fast-csv": "^4.3.5",
     "aws-sdk": "^2.764.0"
   }
 }

@@ -13,8 +13,8 @@
  * limitations under the License.
  */
 
-const debug = require('debug')('signalk-from-csv');
-const trace = require('debug')('signalk-from-csv:trace');
+const debug = require('debug')('signalk-from-batch-format');
+const trace = require('debug')('signalk-from-batch-format:trace');
 
 const _ = require('lodash');
 const aws = require('aws-sdk');
@@ -283,9 +283,9 @@ module.exports = function(app) {
     };
 
     const _plugin = {
-        id: 'signalk-from-csv',
-        name: 'CSV Ingestor',
-        description: 'SignalK server plugin that ingests CSV data from S3/SQS',
+        id: 'signalk-from-batch-format',
+        name: 'Batch format ingestor',
+        description: 'SignalK server plugin that ingests batched json files from S3/SQS',
 
         schema: {
             type: 'object',
