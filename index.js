@@ -18,7 +18,6 @@ const trace = require('debug')('signalk-from-csv:trace');
 
 const _ = require('lodash');
 const aws = require('aws-sdk');
-const csv = require('fast-csv');
 const zlib = require('zlib');
 
 const s3 = new aws.S3();
@@ -31,7 +30,7 @@ module.exports = function(app) {
 
     let _process_message = async function(body) {
         const s3_result = _get_from_s3(body);
-        const rows = await _parse_csv(s3_result);
+        const rows = await _parse_json(s3_result);
 
         _publish_to_signalk(rows);
     };
@@ -50,15 +49,14 @@ module.exports = function(app) {
         return s3.getObject(params).createReadStream();
     };
 
-    let _parse_csv = function(body) {
+    let _parse_json = function(body) {
         return new Promise(function(resolve, reject) {
             const unzipped_stream = body.pipe(zlib.createGunzip());
-            const row_stream = unzipped_stream.pipe(csv.parse({ headers: true }));
 
-            let rows = [];
-            row_stream.on('error', reject);
-            row_stream.on('data', row => rows.push(row));
-            row_stream.on('end', () => resolve(rows));
+            let str = '';
+            unzipped_stream.on('error', reject);
+            unzipped_stream.on('data', data => str += data);
+            unzipped_stream.on('end', () => resolve(JSON.parse(str)));
         });
     };
 
@@ -71,124 +69,122 @@ module.exports = function(app) {
         }
     };
 
-    let _filter_compound_values = function(updates, re) {
-        // extract the string before the last .
-        const prefix = function(s) {
-            const last_dot = s.lastIndexOf('.');
-            return s.substring(0, last_dot);
-        };
-        // extract the string after the last .
-        const suffix = function(s) {
-            const last_dot = s.lastIndexOf('.');
-            return s.substring(last_dot + 1);
-        };
+    // TODO: refactor into signalk-batcher and add unit tests
+    let _visit_non_objects = function(obj, fn) {
+        let _do_visit = function(obj, path, fn) {
+            _.forIn(obj, function(value, key) {
+                const key_path = path != '' ? `${path}.${key}`: key;
 
-        // partition the updates into those that match the re and those that
-        // don't.  Those that do match need to be combined.
-        const partitioned = _.partition(updates, u => re.test(u.values[0].path));
-        const to_combine = partitioned[0];
-
-        // construct an object with the keys as the suffix of the path, and the
-        // values as the values
-        const combined_value = {};
-        to_combine.forEach(function(c) {
-            // assign to combined values
-            combined_value[suffix(c.values[0].path)] = c.values[0].value;
-        });
-
-        // create a single combined object
-        const combined = {
-            // timestamps should all be the same, so just use the first
-            timestamp: to_combine[0].timestamp,
-            values: [{
-                // prefixes should all be the same, so just use the prefix of
-                // the first
-                path: prefix(to_combine[0].values[0].path),
-                value: combined_value
-            }]
-        };
-
-        // join the the combined object with everything else
-        return _.concat(partitioned[1], combined);
-    };
-
-    let _filter_updates_from_past = function() {
-        // ensure we don't ingest old values by tracking the most recent timestamp we've seen
-        // TODO: perhaps this should be in signalk core?
-        const _timestamps_by_path = {};
-
-        return function(updates) {
-            // first, ensure that each path is present in _timestamps_by_path
-            updates.forEach(function(u) {
-                if (!_timestamps_by_path[u.values[0].path]) {
-                    _timestamps_by_path[u.values[0].path] = new Date(0);
+                // if value is an object, recurse (note that arrays are
+                // objects, so hence the plain object check)
+                if (_.isPlainObject(value)) {
+                    _do_visit(value, key_path, fn);
+                }
+                // otherwise, emit the parent
+                else {
+                    fn(path, obj);
                 }
             });
-
-            // only keep the updates that are newer
-            updates = updates.filter(function(u) {
-                return new Date(u.timestamp) > _timestamps_by_path[u.values[0].path];
-            });
-
-            // update _timestamps_by_path
-            updates.forEach(function(u) {
-                _timestamps_by_path[u.values[0].path] = new Date(u.timestamp);
-            });
-
-            return updates;
         };
-    }();
 
-    let _publish_to_signalk = function(rows) {
-        let updates = rows.map(function(row) {
-            // we only publish the last timestamp, so remove the path key
-            const data = _.omit(row, ['path', 'source']);
+        return _do_visit(obj, '', fn);
+    };
 
-            // the rest of the keys are timestamps
-            const timestamps = _.keys(data);
-            // sort them, so the largest timestamp is now last
-            timestamps.sort();
+    let _publish_to_signalk = function(state) {
+        const context_self = `vessels.${state.self}`;
+        const base_time_ms = Date.parse(state.timestamp);
 
-            // extract the last timestamp and associated value
-            const last_timestamp = timestamps[timestamps.length - 1];
-            const value = _get_value(data[last_timestamp]);
+        const vessel_state = _.get(state, context_self);
 
-            // return a signalk update in delta format
-            // (this will be part of a list)
-            const delta = {
-                timestamp: new Date(parseInt(last_timestamp)).toISOString(),
-                values: [{
-                    path: row.path,
-                    value: value
+        // list of complex objects that need to be fixed, due to how signalk
+        // for some reasons allows complex objects for some data types
+        const complex_objects = [
+            { re: /\.position\.(latitude|longitude)$/, num: 2 },
+            { re: /\.attitude\.(yaw|roll|pitch)$/, num: 3 },
+        ];
+
+        // a cache of what we've seen so far for the complex objects
+        const complex_object_cache = {};
+
+        // helper function to do the actual publishing
+        const publish = function($source, last_delta_t, path, value) {
+            // TODO: it'd be better to build up a batch and send a single
+            // delta, but since handleMessage overrides the source.label
+            // attribute, I have to pretend to be multiple providers
+            // instead of a single provider.  Additionally, I'm forced to pass
+            // in $source, rather than the source object.  Sigh.
+            //
+            // The real TODO is to fix signalk itself, once I understand the
+            // reasoning as to why it works this way.
+            const msg = {
+                context: context_self,
+                updates: [{
+                    $source: $source,
+                    timestamp: new Date(base_time_ms + last_delta_t),
+                    values: [{
+                        path: path,
+                        value: value
+                    }]
                 }]
             };
 
-            // add the source, if it exists
-            // TODO: this does no good, because for some reason, signalk stomps
-            // source.label with my providerId (ie pluginId).  You're killing
-            // me smalls.
-            if (false && row.source) {
-                delta.source = {
-                    label: row.source
-                };
-            }
+            app.handleMessage($source, msg);
+        };
 
-            return delta;
-        });
+        // TODO: refactor into signalk-batcher and add unit tests
+        _visit_non_objects(vessel_state, function(path, value) {
+            // path is where we are in the model
+            // value is an array with source to list elements, ie:
+            //
+            //  {
+            //      test-source-1: [[0, 1], [1, 1.2], [2, 1]],
+            //      test-source-2: [[0, 1], [1], [2, 1.1]]
+            //  }
+            //
+            // Each key is a source reference (ie $source), the first element
+            // is the ms from base_time_ms, and the second is the value.  If
+            // value is ommitted, it's the same as the previous value.
 
-        // fix the stupid combined objects, no doubt I'll need to add to this
-        // list.  Sigh...
-        updates = _filter_compound_values(updates, /^navigation\.position\.(latitude|longitude)$/);
-        updates = _filter_compound_values(updates, /^navigation\.attitude\.(yaw|roll|pitch)$/);
+            // for each of the sources, publish
+            _.forIn(value, function(points, $source) {
+                // skip to the end and publish the last time with the last
+                // unique value
+                const last_delta_t = _.last(points)[0];
+                // note: might have to fix this if we're dealing with a complex object
+                let last_value = _.findLast(points, function(pair) {
+                    return pair.length == 2;
+                })[1];
 
-        // ensure we don't regress by ingesting old data based on the timestamp
-        updates = _filter_updates_from_past(updates);
+                // check against the complex objects to see if this path is one
+                // of the ones that needs to be fixed
+                const complex_obj = _.find(complex_objects, function(co) {
+                    return co.re.test(path);
+                });
 
-        // Ugh, signalk swallows any exceptions, so we can't know if this
-        // failed, which means we have no way of knowing whether to consume the
-        // item from SQS or not, which means we always consume it.
-        app.handleMessage(_plugin.id, {
-            updates: updates
+                // if we found a complex object, adjust the path and value
+                if (complex_obj) {
+                    // 1.take the last element off the path
+                    const path_prefix = path.substring(0, path.lastIndexOf('.'));
+                    const path_suffix = path.substring(path.lastIndexOf('.') + 1);
+
+                    // 2. store what we've found so far
+                    _.defaults(complex_object_cache, { [path_prefix]: {} });
+                    _.merge(complex_object_cache[path_prefix], {
+                        [path_suffix]: last_value
+                    });
+
+                    // 3. if we now have all the elements, reconstruct the object
+                    // and handle the message
+                    if (_.keys(complex_object_cache[path_prefix]).length === complex_obj.num) {
+                        trace(`fixed complex object ${path_prefix}`);
+                        path = path_prefix;
+                        last_value = complex_object_cache[path_prefix];
+                    }
+                }
+
+                // publish
+                publish($source, last_delta_t, path, last_value);
+            });
         });
     };
 
