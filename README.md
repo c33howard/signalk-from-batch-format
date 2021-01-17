@@ -1,6 +1,6 @@
-# SignalK from batch format
+# SignalK from Batch Format
 
-SignalK plugin consume json files produced by [signalk-to-batch-format] (see the
+SignalK plugin to consume json files produced by [signalk-to-batch-format] (see the
 README there for more info)
 
 # Configuration
