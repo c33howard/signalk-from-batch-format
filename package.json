@@ -1,6 +1,6 @@
 {
   "name": "signalk-from-batch-format",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Signal K server plugin that ingests data from batch format files",
   "main": "index.js",
   "repository": "https://github.com/c33howard/signalk-from-batch-format.git",
@@ -12,7 +12,9 @@
   "dependencies": {
     "debug": "^2.2.0",
     "lodash": "^4.17.4",
-    "aws-sdk": "^2.764.0",
+    "@aws-sdk/client-s3": "3",
+    "@aws-sdk/client-sqs": "3",
+    "@smithy/abort-controller": "2",
     "signalk-batcher": "^1.1.0"
   }
 }

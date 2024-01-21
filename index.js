@@ -17,26 +17,31 @@ const debug = require('debug')('signalk-from-batch-format');
 const trace = require('debug')('signalk-from-batch-format:trace');
 
 const _ = require('lodash');
-const aws = require('aws-sdk');
 const from_batch = require('signalk-batcher').from_batch_to_delta;
 const zlib = require('zlib');
 
-const s3 = new aws.S3();
-const sqs = new aws.SQS();
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { SQSClient, DeleteMessageBatchCommand, ReceiveMessageCommand } = require("@aws-sdk/client-sqs");
+const { AbortController } = require("@smithy/abort-controller");
+
+const s3_client = new S3Client();
+const sqs_client = new SQSClient();
 
 module.exports = function(app) {
     const TIMEOUT_S = 20;
-    let _in_flight_request;
     let _running = false;
+    const _abort_controller = new AbortController();
 
     let _process_message = async function(body) {
-        const s3_result = _get_from_s3(body);
-        const batch = await _parse_json(s3_result);
+        const read_stream = await _get_from_s3(body);
+        if (read_stream) {
+            const batch = await _parse_json(read_stream);
 
-        _publish_to_signalk(batch);
+            _publish_to_signalk(batch);
+        }
     };
 
-    let _get_from_s3 = function(body) {
+    let _get_from_s3 = async function(body) {
         const s3_record = JSON.parse(body.Message).Records[0].s3;
         const s3_bucket = s3_record.bucket.name;
         const s3_key = decodeURIComponent(s3_record.object.key);
@@ -47,12 +52,19 @@ module.exports = function(app) {
             Bucket: s3_bucket,
             Key: s3_key
         };
-        return s3.getObject(params).createReadStream();
+        const cmd = new GetObjectCommand(params);
+        try {
+            const response = await s3_client.send(cmd);
+            return response.Body;
+        } catch (err) {
+            debug(`error from s3 get ${err}`);
+            return undefined;
+        }
     };
 
-    let _parse_json = function(body) {
+    let _parse_json = function(read_stream) {
         return new Promise(function(resolve, reject) {
-            const unzipped_stream = body.pipe(zlib.createGunzip());
+            const unzipped_stream = read_stream.pipe(zlib.createGunzip());
 
             let str = '';
             unzipped_stream.on('error', reject);
@@ -86,7 +98,7 @@ module.exports = function(app) {
         });
     };
 
-    let _delete_from_sqs = function(options, messages) {
+    let _delete_from_sqs = async function(options, messages) {
         // now that we've received and processed them, communicate
         // success by deleting them from the queue
         const receipt_handles = messages.map(function(m) {
@@ -95,20 +107,19 @@ module.exports = function(app) {
                 ReceiptHandle: m.ReceiptHandle
             };
         });
-        sqs.deleteMessageBatch({
-            QueueUrl: options.sqs_url,
-            Entries: receipt_handles
-        }).
-            on('success', function(response) {
-                trace('done sqs delete');
-            }).
-            on('error', function(err, response) {
-                debug(`could not delete from sqs ${err}`);
-            }).
-            send();
+
+        try {
+            await sqs_client.send(new DeleteMessageBatchCommand({
+                QueueUrl: options.sqs_url,
+                Entries: receipt_handles
+            }));
+            trace('done sqs delete');
+        } catch (err) {
+            debug(`could not delete from sqs ${err}`);
+        }
     };
 
-    let _poll_sqs = function(options) {
+    let _poll_sqs = async function(options) {
         const params = {
             QueueUrl: options.sqs_url,
             WaitTimeSeconds: TIMEOUT_S,
@@ -116,46 +127,45 @@ module.exports = function(app) {
             // the only consumer and we only care about the latest data
             MaxNumberOfMessages: 10
         };
-
         const request_start = Date.now();
-        _in_flight_request = sqs.receiveMessage(params).
-            on('success', function(response) {
-                const messages = response.data.Messages;
 
-                if (_.isUndefined(messages) || messages.length == 0) {
-                    trace('sqs has no messages to process');
-                    return;
-                }
+        try {
+            const response = await sqs_client.send(
+                new ReceiveMessageCommand(params),
+                { abortSignal: _abort_controller.signal }
+            );
 
+            trace(`sqs response: ${response}`);
+            const messages = response.Messages;
+
+            if (_.isUndefined(messages) || messages.length == 0) {
+                trace('sqs has no messages to process');
+            } else {
                 // we care about the most recent data, so we only want the last message
                 const message = messages[messages.length - 1];
 
                 // process the message
                 trace('process message body');
-                _process_message(JSON.parse(message.Body));
+                await _process_message(JSON.parse(message.Body));
                 trace('done process message body');
 
-                _delete_from_sqs(options, messages);
-            }).
-            on('error', function(err, response) {
-                console.log(err, err.stack);
-            }).
-            on('complete', function(response) {
-                // clear the inflight request
-                _in_flight_request = undefined;
-                // schedule a new sqs poll
-                if (_running) {
-                    const since_start_ms = Math.min(Date.now() - request_start, 1000);
+                await _delete_from_sqs(options, messages);
+            }
+        } catch (err) {
+            console.log(err, err.stack);
+        }
 
-                    // never make more than one call every 1s
-                    const delay_ms = since_start_ms >= 1000 ? 0 : 1000;
-                    
-                    setTimeout(function() {
-                        _poll_sqs(options);
-                    }, delay_ms);
-                }
-            }).
-            send();
+        // schedule a new sqs poll
+        if (_running) {
+            const since_start_ms = Math.min(Date.now() - request_start, 1000);
+
+            // never make more than one call every 1s
+            const delay_ms = since_start_ms >= 1000 ? 0 : 1000;
+
+            setTimeout(function() {
+                _poll_sqs(options);
+            }, delay_ms);
+        }
     };
 
     let _start = function(options) {
@@ -174,10 +184,7 @@ module.exports = function(app) {
 
         _running = false;
 
-        if (_in_flight_request) {
-            _in_flight_request.abort();
-            _in_flight_request = undefined;
-        }
+        _abort_controller.abort();
     };
 
     const _plugin = {
